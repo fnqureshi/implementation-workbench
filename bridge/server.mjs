@@ -1,10 +1,10 @@
 import http from "node:http";
 import { ACTOR_ID, ACTOR_NAME, ACTOR_ROLE, BRIDGE_HOST, BRIDGE_PORT, ALLOWED_ORIGINS, REQUIRE_SEPARATE_REVIEW } from "./config.mjs";
 import { store } from "./db.mjs";
-import { planTask, implementTask } from "./agent-runner.mjs";
+import { deriveOperation, executePlannedTask, followUpTask, planTask } from "./agent-runner.mjs";
 import { probeSdk } from "./sdk-adapter.mjs";
 import { listTenants, saveTenantCredential, testTenantConnection } from "./tenants.mjs";
-import { publicProfile, publicProfiles, saveProviderCredential, testProvider } from "./providers.mjs";
+import { listProviderModels, publicProfile, publicProfiles, saveProviderCredential, testProvider } from "./providers.mjs";
 import { PROVIDER_DEFINITIONS, publicProviderDefinitions } from "./provider-core.mjs";
 import { assertRole } from "./policy.mjs";
 
@@ -39,15 +39,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/bootstrap") {
       const snapshot = store.bootstrap();
       const tasks = snapshot.tasks.map((task) => without(task, ["planning_model"]));
-      const runs = snapshot.runs.map((run) => without(run, ["provider", "model", "request_id", "usage_json"]));
+      const runs = snapshot.runs.map((run) => without(run, ["request_id", "usage_json"]));
+      const messages = snapshot.messages.map((message) => without(message, ["source_json", "metadata_json"]));
       const approvals = snapshot.approvals.map((approval) => ({ ...approval, payload: { scope: approval.payload.scope, liveWrites: approval.payload.liveWrites } }));
-      return send(res, 200, { ...snapshot, tasks, runs, approvals, providers: await publicProfiles(snapshot.providers), providerDefinitions: publicProviderDefinitions(), system: await probeSdk(), tenants: await listTenants(snapshot.connections) }, origin);
+      return send(res, 200, { ...snapshot, tasks, runs, messages, approvals, providers: await publicProfiles(snapshot.providers), providerDefinitions: publicProviderDefinitions(), system: await probeSdk(), tenants: await listTenants(snapshot.connections) }, origin);
     }
     if (req.method === "POST" && url.pathname === "/api/providers") {
       requireWriteIntent(req); assertRole(ACTOR_ROLE, "manage_providers"); const input = await body(req);
       if (!["connector-a", "connector-b"].includes(input.provider)) return send(res, 400, { error: "Choose an available planning connector" }, origin);
       if (!input.label?.trim() || !input.apiKey) return send(res, 400, { error: "Connector label and API key are required" }, origin);
-      const profile = store.createProviderProfile({ ...input, model: PROVIDER_DEFINITIONS[input.provider].defaultModel });
+      const requestedModel = typeof input.model === "string" && /^[A-Za-z0-9._:/-]{1,120}$/.test(input.model) ? input.model : PROVIDER_DEFINITIONS[input.provider].defaultModel;
+      const profile = store.createProviderProfile({ ...input, model: requestedModel });
       try {
         await saveProviderCredential(profile.id, input.apiKey);
         store.addEvent({ type: "provider", title: "Planning connector connected", detail: profile.label, actor: ACTOR_NAME, actorId: ACTOR_ID });
@@ -63,6 +65,23 @@ const server = http.createServer(async (req, res) => {
       if (!profile) return send(res, 404, { error: "Provider profile not found" }, origin);
       try { const result = await testProvider(profile); store.setProviderStatus(profile.id, "connected"); return send(res, 200, { ...result, label: profile.label }, origin); }
       catch (error) { store.setProviderStatus(profile.id, "failed", String(error.message || error).slice(0, 500)); return send(res, 400, { error: String(error.message || error) }, origin); }
+    }
+    const providerModelsMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/models$/);
+    if (req.method === "GET" && providerModelsMatch) {
+      assertRole(ACTOR_ROLE, "read"); const profile = store.providerProfile(providerModelsMatch[1]);
+      if (!profile) return send(res, 404, { error: "Provider profile not found" }, origin);
+      try { return send(res, 200, { models: await listProviderModels(profile) }, origin); }
+      catch (error) { return send(res, 400, { error: String(error.message || error) }, origin); }
+    }
+    const providerModelMatch = url.pathname.match(/^\/api\/providers\/([^/]+)\/model$/);
+    if (req.method === "POST" && providerModelMatch) {
+      requireWriteIntent(req); assertRole(ACTOR_ROLE, "manage_providers"); const input = await body(req);
+      const profile = store.providerProfile(providerModelMatch[1]);
+      if (!profile) return send(res, 404, { error: "Provider profile not found" }, origin);
+      if (typeof input.model !== "string" || !/^[A-Za-z0-9._:/-]{1,120}$/.test(input.model)) return send(res, 400, { error: "Choose a valid model" }, origin);
+      const updated = store.setProviderModel(profile.id, input.model);
+      store.addEvent({ type: "provider", title: "Default model changed", detail: `${profile.label}: ${input.model}`, actor: ACTOR_NAME, actorId: ACTOR_ID });
+      return send(res, 200, await publicProfile(updated), origin);
     }
     const credentialMatch = url.pathname.match(/^\/api\/tenants\/([^/]+)\/credential$/);
     if (req.method === "POST" && credentialMatch) {
@@ -104,7 +123,52 @@ const server = http.createServer(async (req, res) => {
       if (input.providerProfileId && !store.providerProfile(input.providerProfileId)) return send(res, 400, { error: "Planning provider is not available" }, origin);
       const availableTenants = await listTenants(store.bootstrap().connections);
       if (!availableTenants.some((item) => item.name === input.environment)) return send(res, 400, { error: "Choose a configured tenant environment" }, origin);
-      const task = store.createTask(input); void planTask(store, task.id); return send(res, 202, task, origin);
+      const task = store.createTask(input); void planTask(store, task.id, { allowAutopilot: !REQUIRE_SEPARATE_REVIEW }); return send(res, 202, task, origin);
+    }
+    const retryAnalysisMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/retry-analysis$/);
+    if (req.method === "POST" && retryAnalysisMatch) {
+      requireWriteIntent(req); assertRole(ACTOR_ROLE, "create_task"); const task = store.task(retryAnalysisMatch[1]);
+      if (!task) return send(res, 404, { error: "Task not found" }, origin);
+      if (!["needs-attention", "ready"].includes(task.status)) return send(res, 409, { error: "Analysis can only be retried after it finishes or needs attention" }, origin);
+      store.setTaskStatus(task.id, "planning");
+      store.addEvent({ taskId: task.id, clientId: task.client_id, type: "agent", title: "Analysis retry requested", detail: "Read-only analysis restarted", actor: ACTOR_NAME, actorId: ACTOR_ID });
+      const latestUserMessage = store.messagesForTask(task.id).filter((message) => message.role === "user").at(-1)?.content || task.request;
+      void planTask(store, task.id, { query: latestUserMessage, allowAutopilot: !REQUIRE_SEPARATE_REVIEW });
+      return send(res, 202, store.task(task.id), origin);
+    }
+    const taskMessagesMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/messages$/);
+    if (req.method === "POST" && taskMessagesMatch) {
+      requireWriteIntent(req); assertRole(ACTOR_ROLE, "create_task"); const input = await body(req); const task = store.task(taskMessagesMatch[1]);
+      if (!task) return send(res, 404, { error: "Task not found" }, origin);
+      if (["planning", "implementing"].includes(task.status)) return send(res, 409, { error: "This task is already working. Wait for the current response before sending another follow-up." }, origin);
+      if (typeof input.content !== "string" || !input.content.trim() || input.content.length > 10_000) return send(res, 400, { error: "Enter a follow-up message under 10,000 characters" }, origin);
+      void followUpTask(store, task.id, input.content, { allowAutopilot: !REQUIRE_SEPARATE_REVIEW });
+      return send(res, 202, { accepted: true, taskId: task.id }, origin);
+    }
+    const taskSettingsMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/settings$/);
+    if (req.method === "POST" && taskSettingsMatch) {
+      requireWriteIntent(req); assertRole(ACTOR_ROLE, "create_task"); const input = await body(req); const task = store.task(taskSettingsMatch[1]);
+      if (!task) return send(res, 404, { error: "Task not found" }, origin);
+      if (input.providerProfileId && !store.providerProfile(input.providerProfileId)) return send(res, 400, { error: "Planning provider is not available" }, origin);
+      if (input.executionMode && !["review", "autopilot"].includes(input.executionMode)) return send(res, 400, { error: "Choose review or autopilot mode" }, origin);
+      const updated = store.setTaskSettings(task.id, input);
+      store.addEvent({ taskId: task.id, clientId: task.client_id, type: "settings", title: "Conversation settings updated", detail: `${updated.execution_mode} · ${updated.provider_profile_id}`, actor: ACTOR_NAME, actorId: ACTOR_ID });
+      return send(res, 200, updated, origin);
+    }
+    const approveExecuteMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/approve-and-execute$/);
+    if (req.method === "POST" && approveExecuteMatch) {
+      requireWriteIntent(req); assertRole(ACTOR_ROLE, "request_implementation"); const task = store.task(approveExecuteMatch[1]);
+      if (!task) return send(res, 404, { error: "Task not found" }, origin);
+      if (task.status !== "ready") return send(res, 409, { error: "The task must have a completed plan before local execution can begin" }, origin);
+      if (store.pendingApprovalForTask(task.id)) return send(res, 409, { error: "This task already has a pending implementation approval" }, origin);
+      const operation = task.plan?.operation || deriveOperation(task, task.request);
+      const action = operation?.kind === "tenant-read" ? "run_read" : "implement_local";
+      const scope = action === "run_read" ? `${operation?.environment || task.environment} tenant read` : "Ticket working copy only";
+      const approval = store.createApproval(task.id, action, { scope, liveWrites: false, sdkSourceChanges: false, operation });
+      store.addEvent({ taskId: task.id, clientId: task.client_id, type: "approval", title: action === "run_read" ? "Tenant read approved" : "Plan approved for local execution", detail: "No live tenant write is included", actor: ACTOR_NAME, actorId: ACTOR_ID });
+      if (REQUIRE_SEPARATE_REVIEW) return send(res, 202, approval, origin);
+      const updated = store.resolveApproval(approval.id, "approved"); void executePlannedTask(store, task.id);
+      return send(res, 200, updated, origin);
     }
     const implementMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)\/request-implementation$/);
     if (req.method === "POST" && implementMatch) {
@@ -127,7 +191,7 @@ const server = http.createServer(async (req, res) => {
       if (approvalMatch[2] === "approve" && REQUIRE_SEPARATE_REVIEW && approval.requested_by === ACTOR_ID) return send(res, 403, { error: "A different reviewer must approve this action" }, origin);
       const decision = approvalMatch[2] === "approve" ? "approved" : "rejected"; const updated = store.resolveApproval(approval.id, decision); const task = store.task(approval.task_id);
       store.addEvent({ taskId: task.id, clientId: task.client_id, type: "approval", title: `Action ${decision}`, detail: approval.action, actor: "user" });
-      if (decision === "approved" && approval.action === "implement_local") void implementTask(store, task.id);
+      if (decision === "approved" && ["implement_local", "run_read"].includes(approval.action)) void executePlannedTask(store, task.id);
       return send(res, 200, updated, origin);
     }
     return send(res, 404, { error: "Not found" }, origin);

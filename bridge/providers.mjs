@@ -29,12 +29,35 @@ export async function publicProfiles(profiles) {
 export async function publicProfile(profile) {
   const definition = PROVIDER_DEFINITIONS[profile.provider];
   return {
-    id: profile.id, label: profile.label, scope: profile.scope, status: profile.status,
+    id: profile.id, provider: profile.provider, label: profile.label, model: profile.model, scope: profile.scope, status: profile.status,
     last_tested_at: profile.last_tested_at, last_error: profile.last_error,
     local: profile.provider === "local-agent",
     credentialPresent: profile.provider === "local-agent" || await keychainHas(profile.id),
     definition: definition ? { name: definition.name, capabilities: definition.capabilities } : { name: "Planning connector", capabilities: [] },
   };
+}
+
+export async function listProviderModels(profile) {
+  if (profile.provider === "local-agent") return [{ id: "private", name: "Local implementation agent" }];
+  const key = await providerKey(profile);
+  if (profile.provider === "connector-a") {
+    const headers = { authorization: `Bearer ${key}` };
+    if (profile.project_id) headers["OpenAI-Project"] = profile.project_id;
+    const { payload } = await requestJson("https://api.openai.com/v1/models", { headers });
+    return (payload.data || [])
+      .map((item) => ({ id: String(item.id || ""), name: String(item.id || "") }))
+      .filter((item) => /^(gpt-|o\d|chatgpt-)/i.test(item.id))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  }
+  if (profile.provider === "connector-b") {
+    const headers = { "x-api-key": key, "anthropic-version": "2023-06-01" };
+    const { payload } = await requestJson("https://api.anthropic.com/v1/models?limit=100", { headers });
+    return (payload.data || [])
+      .map((item) => ({ id: String(item.id || ""), name: String(item.display_name || item.id || "") }))
+      .filter((item) => item.id)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  throw new Error("Unsupported provider");
 }
 
 async function requestJson(url, options, timeout = 45_000) {
@@ -91,4 +114,30 @@ export async function planWithProvider(profile, prompt) {
     return { plan: normalizePlan(extractJson(messagesOutputText(payload))), raw: JSON.stringify(payload), requestId, usage: payload.usage || null };
   }
   throw new Error("Unsupported API planning provider");
+}
+
+export async function respondWithProvider(profile, prompt) {
+  const key = await providerKey(profile);
+  if (profile.provider === "connector-a") {
+    const headers = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+    if (profile.project_id) headers["OpenAI-Project"] = profile.project_id;
+    const { payload, requestId } = await requestJson("https://api.openai.com/v1/responses", {
+      method: "POST", headers,
+      body: JSON.stringify({ model: profile.model, input: prompt, store: false }),
+    }, 120_000);
+    return { text: responsesOutputText(payload).trim(), raw: JSON.stringify(payload), requestId, usage: payload.usage || null };
+  }
+  if (profile.provider === "connector-b") {
+    const headers = { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+    const { payload, requestId } = await requestJson("https://api.anthropic.com/v1/messages", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        model: profile.model, max_tokens: 2600,
+        system: "You are the Implementation Workbench assistant. Answer from the supplied task evidence. Be concise, state uncertainty, and never reveal credentials or tokens.",
+        messages: [{ role: "user", content: prompt }],
+      }),
+    }, 120_000);
+    return { text: messagesOutputText(payload).trim(), raw: JSON.stringify(payload), requestId, usage: payload.usage || null };
+  }
+  throw new Error("Unsupported API conversation provider");
 }

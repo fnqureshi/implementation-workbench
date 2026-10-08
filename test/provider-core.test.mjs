@@ -18,9 +18,9 @@ test("extracts text from supported connector responses", () => {
   assert.equal(messagesOutputText({ content: [{ type: "text", text: "connector-b" }] }), "connector-b");
 });
 
-test("public connector definitions never expose model identifiers", () => {
+test("public connector definitions expose provider defaults for model settings", () => {
   const definitions = publicProviderDefinitions();
-  assert.equal(definitions.some((item) => Object.hasOwn(item, "defaultModel")), false);
-  assert.equal(JSON.stringify(definitions).includes("gpt-"), false);
-  assert.equal(JSON.stringify(definitions).includes("claude-"), false);
+  assert.equal(definitions.every((item) => typeof item.defaultModel === "string"), true);
+  assert.equal(definitions.some((item) => item.name === "OpenAI / ChatGPT"), true);
+  assert.equal(definitions.some((item) => item.name === "Anthropic / Claude"), true);
 });

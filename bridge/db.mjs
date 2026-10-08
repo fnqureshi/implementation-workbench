@@ -74,6 +74,17 @@ db.exec(`
     started_at TEXT NOT NULL,
     completed_at TEXT
   );
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'message',
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'complete',
+    source_json TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL
+  );
   CREATE TABLE IF NOT EXISTS tenant_connections (
     env_name TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -110,6 +121,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_memories_client_status ON memories(client_id, status);
   CREATE INDEX IF NOT EXISTS idx_events_task_created ON events(task_id, created_at);
   CREATE INDEX IF NOT EXISTS idx_approvals_task_status ON approvals(task_id, status);
+  CREATE INDEX IF NOT EXISTS idx_chat_messages_task_created ON chat_messages(task_id, created_at);
 `);
 
 function ensureColumn(table, name, definition) {
@@ -125,6 +137,7 @@ ensureColumn("memories", "created_by", "TEXT NOT NULL DEFAULT 'local-user'");
 ensureColumn("tasks", "provider_profile_id", "TEXT");
 ensureColumn("tasks", "planning_model", "TEXT");
 ensureColumn("tasks", "memory_snapshot_json", "TEXT");
+ensureColumn("tasks", "execution_mode", "TEXT NOT NULL DEFAULT 'review'");
 ensureColumn("approvals", "snapshot_hash", "TEXT");
 ensureColumn("approvals", "requested_by", "TEXT");
 ensureColumn("approvals", "resolved_by", "TEXT");
@@ -138,6 +151,16 @@ db.exec("PRAGMA optimize");
 const now = () => new Date().toISOString();
 const id = (prefix) => `${prefix}_${randomUUID()}`;
 const slugify = (value) => value.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+for (const task of db.prepare("SELECT * FROM tasks WHERE NOT EXISTS (SELECT 1 FROM chat_messages WHERE chat_messages.task_id = tasks.id)").all()) {
+  db.prepare("INSERT INTO chat_messages (id, task_id, role, kind, content, status, source_json, metadata_json, created_at) VALUES (?, ?, 'user', 'request', ?, 'complete', '[]', '{}', ?)")
+    .run(id("message"), task.id, task.request, task.created_at);
+  if (task.plan_json) {
+    const plan = JSON.parse(task.plan_json);
+    db.prepare("INSERT INTO chat_messages (id, task_id, role, kind, content, status, source_json, metadata_json, created_at) VALUES (?, ?, 'assistant', 'plan', ?, 'complete', ?, ?, ?)")
+      .run(id("message"), task.id, plan.summary || "Plan ready", JSON.stringify(["Task history"]), JSON.stringify({ plan, operation: plan.operation || null }), task.updated_at);
+  }
+}
 
 const count = db.prepare("SELECT COUNT(*) AS count FROM clients").get().count;
 if (count === 0) {
@@ -156,6 +179,15 @@ db.prepare("INSERT OR IGNORE INTO team_members (id, display_name, role, active, 
 function parseTask(row) {
   if (!row) return null;
   return { ...row, plan: row.plan_json ? JSON.parse(row.plan_json) : null, memory_snapshot: row.memory_snapshot_json ? JSON.parse(row.memory_snapshot_json) : null };
+}
+
+function parseMessage(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    sources: row.source_json ? JSON.parse(row.source_json) : [],
+    metadata: row.metadata_json ? JSON.parse(row.metadata_json) : {},
+  };
 }
 
 export const store = {
@@ -178,10 +210,11 @@ export const store = {
       payload: JSON.parse(row.payload_json),
     }));
     const runs = db.prepare("SELECT * FROM agent_runs ORDER BY started_at DESC LIMIT 100").all();
+    const messages = db.prepare("SELECT * FROM chat_messages ORDER BY created_at ASC LIMIT 1000").all().map(parseMessage);
     const connections = db.prepare("SELECT * FROM tenant_connections ORDER BY env_name ASC").all();
     const providers = db.prepare("SELECT * FROM provider_profiles WHERE enabled = 1 ORDER BY created_at ASC").all();
     const members = db.prepare("SELECT * FROM team_members WHERE active = 1 ORDER BY created_at ASC").all();
-    return { clients, tasks, memories, events, approvals, runs, connections, providers, members, currentActor: { id: ACTOR_ID, name: ACTOR_NAME, role: ACTOR_ROLE } };
+    return { clients, tasks, memories, events, approvals, runs, messages, connections, providers, members, currentActor: { id: ACTOR_ID, name: ACTOR_NAME, role: ACTOR_ROLE } };
   },
   client(clientId) {
     return db.prepare("SELECT * FROM clients WHERE id = ?").get(clientId);
@@ -224,6 +257,10 @@ export const store = {
     db.prepare("UPDATE provider_profiles SET status = ?, last_tested_at = ?, last_error = ?, updated_at = ? WHERE id = ?").run(status, now(), error, now(), profileId);
     return this.providerProfile(profileId);
   },
+  setProviderModel(profileId, model) {
+    db.prepare("UPDATE provider_profiles SET model = ?, updated_at = ? WHERE id = ?").run(model, now(), profileId);
+    return this.providerProfile(profileId);
+  },
   createTask(input) {
     const stamp = now();
     const created = {
@@ -231,13 +268,16 @@ export const store = {
       title: input.title.trim() || input.request.trim().slice(0, 72), request: input.request.trim(),
       product: input.product.trim(), environment: input.environment, status: "planning", risk: "unknown",
       provider_profile_id: input.providerProfileId || "provider_local_agent", planning_model: input.planningModel || null,
+      execution_mode: input.executionMode === "autopilot" ? "autopilot" : "review",
       plan_json: null, memory_snapshot_json: null, created_at: stamp, updated_at: stamp,
     };
     db.prepare(`
-      INSERT INTO tasks (id, client_id, ticket, title, request, product, environment, status, risk, provider_profile_id, planning_model, plan_json, memory_snapshot_json, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(created.id, created.client_id, created.ticket, created.title, created.request, created.product, created.environment, created.status, created.risk, created.provider_profile_id, created.planning_model, created.plan_json, created.memory_snapshot_json, created.created_at, created.updated_at);
+      INSERT INTO tasks (id, client_id, ticket, title, request, product, environment, status, risk, provider_profile_id, planning_model, execution_mode, plan_json, memory_snapshot_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(created.id, created.client_id, created.ticket, created.title, created.request, created.product, created.environment, created.status, created.risk, created.provider_profile_id, created.planning_model, created.execution_mode, created.plan_json, created.memory_snapshot_json, created.created_at, created.updated_at);
     this.addEvent({ taskId: created.id, clientId: created.client_id, type: "request", title: "Implementation requested", detail: created.request, actor: "user" });
+    this.addMessage({ taskId: created.id, role: "user", kind: "request", content: created.request, sources: [], metadata: { ticket: created.ticket } });
+    this.addEvent({ taskId: created.id, clientId: created.client_id, type: "mode", title: created.execution_mode === "autopilot" ? "Autopilot authorized" : "Plan review required", detail: created.execution_mode === "autopilot" ? "Analyze, plan, and update the local ticket working copy. Live writes remain blocked." : "Stop after planning until the user approves local execution.", actor: "user" });
     return parseTask(created);
   },
   setTaskPlan(taskId, plan, status = "ready") {
@@ -247,6 +287,15 @@ export const store = {
   },
   setTaskStatus(taskId, status) {
     db.prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?").run(status, now(), taskId);
+  },
+  setTaskSettings(taskId, input) {
+    const task = this.task(taskId);
+    if (!task) return null;
+    const providerId = input.providerProfileId || task.provider_profile_id;
+    const executionMode = input.executionMode === "autopilot" ? "autopilot" : input.executionMode === "review" ? "review" : task.execution_mode;
+    db.prepare("UPDATE tasks SET provider_profile_id = ?, execution_mode = ?, updated_at = ? WHERE id = ?")
+      .run(providerId, executionMode, now(), taskId);
+    return this.task(taskId);
   },
   createMemory(input) {
     const stamp = now();
@@ -272,6 +321,24 @@ export const store = {
     db.prepare("INSERT INTO events (id, task_id, client_id, type, title, detail, actor, actor_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .run(created.id, created.task_id, created.client_id, created.type, created.title, created.detail, created.actor, created.actor_id, created.created_at);
     return created;
+  },
+  addMessage(input) {
+    const created = {
+      id: id("message"), task_id: input.taskId, role: input.role,
+      kind: input.kind || "message", content: String(input.content || ""),
+      status: input.status || "complete", source_json: JSON.stringify(input.sources || []),
+      metadata_json: JSON.stringify(input.metadata || {}), created_at: now(),
+    };
+    db.prepare("INSERT INTO chat_messages (id, task_id, role, kind, content, status, source_json, metadata_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(created.id, created.task_id, created.role, created.kind, created.content, created.status, created.source_json, created.metadata_json, created.created_at);
+    db.prepare("UPDATE tasks SET updated_at = ? WHERE id = ?").run(created.created_at, created.task_id);
+    return parseMessage(created);
+  },
+  messagesForTask(taskId) {
+    return db.prepare("SELECT * FROM chat_messages WHERE task_id = ? ORDER BY created_at ASC").all(taskId).map(parseMessage);
+  },
+  runsForTask(taskId) {
+    return db.prepare("SELECT * FROM agent_runs WHERE task_id = ? ORDER BY started_at DESC").all(taskId);
   },
   taskSnapshot(taskId) {
     const task = this.task(taskId); const memories = this.memoriesForClient(task.client_id);

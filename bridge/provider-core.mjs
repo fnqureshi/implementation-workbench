@@ -4,17 +4,17 @@ export const PROVIDER_DEFINITIONS = {
     capabilities: ["plan", "implement", "review"], defaultModel: "private",
   },
   "connector-a": {
-    id: "connector-a", name: "Cloud planning connector A", keyRequired: true,
+    id: "connector-a", name: "OpenAI / ChatGPT", keyRequired: true,
     capabilities: ["plan", "review"], defaultModel: "gpt-5.4",
   },
   "connector-b": {
-    id: "connector-b", name: "Cloud planning connector B", keyRequired: true,
+    id: "connector-b", name: "Anthropic / Claude", keyRequired: true,
     capabilities: ["plan", "review"], defaultModel: "claude-sonnet-4-6",
   },
 };
 
 export function publicProviderDefinitions() {
-  return Object.values(PROVIDER_DEFINITIONS).map(({ id, name, keyRequired, capabilities }) => ({ id, name, keyRequired, capabilities }));
+  return Object.values(PROVIDER_DEFINITIONS).map(({ id, name, keyRequired, capabilities, defaultModel }) => ({ id, name, keyRequired, capabilities, defaultModel }));
 }
 
 export const PLAN_SCHEMA = {
@@ -23,7 +23,7 @@ export const PLAN_SCHEMA = {
   properties: {
     summary: { type: "string" },
     risk: { type: "string", enum: ["low", "medium", "high"] },
-    steps: { type: "array", items: { type: "string" }, minItems: 1 },
+    steps: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 6 },
     relevantMemory: { type: "array", items: { type: "string" } },
     note: { type: "string" },
   },
@@ -33,7 +33,7 @@ export const PLAN_SCHEMA = {
 export function normalizePlan(value) {
   if (!value || typeof value !== "object" || typeof value.summary !== "string" || !Array.isArray(value.steps) || !value.steps.length) throw new Error("Provider returned an invalid implementation plan");
   const risk = ["low", "medium", "high"].includes(value.risk) ? value.risk : "unknown";
-  return { summary: value.summary, risk, steps: value.steps.map(String), relevantMemory: Array.isArray(value.relevantMemory) ? value.relevantMemory.map(String) : [], note: String(value.note || "") };
+  return { summary: value.summary, risk, steps: value.steps.slice(0, 6).map(String), relevantMemory: Array.isArray(value.relevantMemory) ? value.relevantMemory.map(String) : [], note: String(value.note || "") };
 }
 
 export function extractJson(text) {
